@@ -115,9 +115,6 @@ ERROR: No Kaggle credentials found. Run this in Colab before the script:
     os.environ['KAGGLE_API_TOKEN'] = userdata.get('KAGGLE_API_TOKEN')
 """)
     sys.exit(1)
-    # enforce correct permissions (Kaggle API requires 600)
-    kaggle_json.chmod(0o600)
-    print("✓ kaggle.json found")
 
 
 def download_from_kaggle():
@@ -154,60 +151,69 @@ def extract_zip(zip_path: Path, extract_to: Path):
     return extract_to
 
 
-def find_image_label_pairs(search_root: Path):
+def find_image_label_pairs(img_dir: Path, lbl_dir: Path):
     """
-    Walk search_root recursively, collect all .jpg paths and pair each with
-    its matching .txt label file (same stem, same or sibling folder).
-    Returns list of (img_path, label_path_or_None).
+    Given separate image and label directories, pair each jpg with its
+    corresponding txt file. Images with no label get an empty txt file
+    (valid for YOLO — means image has no signs).
     """
-    images = sorted(search_root.rglob("*.jpg"))
     pairs = []
-    for img in images:
-        # label in same folder
-        label = img.with_suffix(".txt")
-        if not label.exists():
-            # label in a sibling 'labels' folder  e.g. images/train → labels/train
-            alt = (img.parent.parent / "labels" / img.parent.name / img.stem).with_suffix(".txt")
-            label = alt if alt.exists() else None
-        pairs.append((img, label))
+    for img in sorted(img_dir.glob("*.jpg")):
+        lbl = lbl_dir / img.with_suffix(".txt").name
+        pairs.append((img, lbl if lbl.exists() else None))
     return pairs
+
 
 
 def build_yolo_structure(extract_root: Path):
     """
-    Reorganise extracted files into:
-        data/gtsdb_yolo/
-            images/{train, val, test}/
-            labels/{train, val, test}/
-            data.yaml
-    The Kaggle dataset ships with a train/ and test/ split already.
-    We carve val out of train (VAL_SPLIT fraction).
+    Handles the exact Kaggle GTSDB structure:
+        GTSDB_Train_and_Test/
+            Train/
+                images/
+                labels/
+            Test/
+                images/
+                labels/
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── locate train and test roots inside the extraction ──────────────────
-    # The Kaggle dataset may nest differently; search for folders named
-    # 'train' and 'test' that contain .jpg files.
-    train_img_dirs = [p for p in extract_root.rglob("*[Tt]rain*") if p.is_dir()]
-    test_img_dirs  = [p for p in extract_root.rglob("*[Tt]est*")  if p.is_dir()]
+    # locate Train and Test folders
+    train_img_dir = extract_root / "GTSDB_Train_and_Test" / "Train" / "images"
+    train_lbl_dir = extract_root / "GTSDB_Train_and_Test" / "Train" / "labels"
+    test_img_dir  = extract_root / "GTSDB_Train_and_Test" / "Test"  / "images"
+    test_lbl_dir  = extract_root / "GTSDB_Train_and_Test" / "Test"  / "labels"
 
-    # Prefer the folder with the most jpgs
-    def img_count(d): return len(list(d.glob("*.jpg")))
-    train_root = max(train_img_dirs, key=img_count) if train_img_dirs else extract_root
-    test_root  = max(test_img_dirs,  key=img_count) if test_img_dirs  else None
+    # fallback — search recursively if exact path doesn't match
+    if not train_img_dir.exists():
+        candidates = [p for p in extract_root.rglob("images") if p.is_dir()
+                      and "rain" in str(p.parent).lower()]
+        if candidates:
+            train_img_dir = candidates[0]
+            train_lbl_dir = train_img_dir.parent / "labels"
+        else:
+            raise FileNotFoundError(
+                f"Could not find Train/images inside {extract_root}. "
+                f"Run: !find data/raw/extracted -type d  to inspect."
+            )
 
-    all_train_pairs = find_image_label_pairs(train_root)
-    all_test_pairs  = find_image_label_pairs(test_root) if test_root else []
+    if not test_img_dir.exists():
+        candidates = [p for p in extract_root.rglob("images") if p.is_dir()
+                      and "est" in str(p.parent).lower()]
+        test_img_dir = candidates[0] if candidates else None
+        test_lbl_dir = test_img_dir.parent / "labels" if test_img_dir else None
+
+    # pair images with labels
+    all_train_pairs = find_image_label_pairs(train_img_dir, train_lbl_dir)
+    all_test_pairs  = find_image_label_pairs(test_img_dir, test_lbl_dir) if test_img_dir else []
 
     if not all_train_pairs:
-        # Fallback: treat every jpg in the extraction as training data
-        print("  Warning: could not find train/ folder, using all images as train")
-        all_train_pairs = find_image_label_pairs(extract_root)
+        raise FileNotFoundError(f"No .jpg files found in {train_img_dir}")
 
-    # ── split train → train + val ──────────────────────────────────────────
+    # split train → 80% train / 20% val
     random.seed(RANDOM_SEED)
     random.shuffle(all_train_pairs)
-    n_val   = max(1, int(len(all_train_pairs) * VAL_SPLIT))
+    n_val       = max(1, int(len(all_train_pairs) * VAL_SPLIT))
     val_pairs   = all_train_pairs[:n_val]
     train_pairs = all_train_pairs[n_val:]
 
@@ -217,28 +223,26 @@ def build_yolo_structure(extract_root: Path):
         "test":  all_test_pairs,
     }
 
-    # ── copy files into output structure ──────────────────────────────────
+    # copy into output structure
     for split, pairs in splits.items():
         img_out = OUTPUT_DIR / "images" / split
         lbl_out = OUTPUT_DIR / "labels" / split
         img_out.mkdir(parents=True, exist_ok=True)
         lbl_out.mkdir(parents=True, exist_ok=True)
 
-        copied = 0
+        annotated, empty = 0, 0
         for img_path, label_path in pairs:
-            # copy image
             shutil.copy2(img_path, img_out / img_path.name)
-
-            # copy label if it exists; create empty file otherwise
-            # (empty label = image with no signs, valid for YOLO)
-            dest_label = lbl_out / (img_path.stem + ".txt")
-            if label_path and label_path.exists():
-                shutil.copy2(label_path, dest_label)
+            dest_lbl = lbl_out / img_path.with_suffix(".txt").name
+            if label_path and label_path.exists() and label_path.stat().st_size > 0:
+                shutil.copy2(label_path, dest_lbl)
+                annotated += 1
             else:
-                dest_label.touch()
-            copied += 1
+                dest_lbl.touch()  # empty = image with no signs, valid for YOLO
+                empty += 1
 
-        print(f"  {split:5s}: {copied} images")
+        print(f"  {split:5s} → {annotated + empty} images "
+              f"({annotated} annotated, {empty} no-sign images)")
 
     write_data_yaml()
 
