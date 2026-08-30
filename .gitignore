@@ -19,5 +19,3 @@ runs/
 # OS
 .DS_Store
 
-# Results that are regenerated, not source-controlled
-results/plots/*.png
